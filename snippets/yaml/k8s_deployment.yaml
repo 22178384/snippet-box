@@ -1,0 +1,126 @@
+# Deployment + Service for a stateless web app.
+#
+# This is the version I copy and then trim. It has the pieces that actually
+# matter (probes, resources, non-root) without the Helm-chart ceremony.
+#
+# Apply:
+#   kubectl apply -f k8s_deployment.yaml
+# Watch the rollout:
+#   kubectl rollout status deployment/web
+# Undo a bad one:
+#   kubectl rollout undo deployment/web
+#
+# NOTE: the image below is a placeholder. It will NOT pull. Change it.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  # Start with 2 so a rolling update can happen without downtime. One replica
+  # means every deploy is a brief outage.
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0    # never take a pod down before the new one is ready
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: web
+          # REPLACE ME
+          image: ghcr.io/example/web:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: APP_ENV
+              value: production
+            - name: LOG_LEVEL
+              value: info
+            # Secrets go in a Secret, never inline here. Read from env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: web-secrets
+                  key: database-url
+          # Requests drive scheduling; limits cap usage. If you set limits but
+          # no requests, the scheduler guesses and things get weird. Always
+          # set both.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # readinessGate: don't send traffic until ready.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # livenessGate: restart if it's wedged. Keep initialDelaySeconds
+          # generous; a too-eager liveness probe causes restart loops.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          # Let the app drain connections before the pod is killed.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # readOnlyRootFilesystem means the app needs a writable /tmp
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      # Give in-flight requests time to finish after SIGTERM. Keep this larger
+      # than your slowest request, smaller than your patience.
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  # ClusterIP by default. Change to LoadBalancer/NodePort if you need external
+  # access directly (usually you don't — put an Ingress in front).
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http   # refers to the named containerPort above
+      protocol: TCP
